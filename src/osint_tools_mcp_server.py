@@ -10,15 +10,35 @@ import subprocess
 import tempfile
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Silencing warnings at startup to prevent polluting stdout
+warnings.filterwarnings("ignore")
+if 'PYTHONWARNINGS' not in os.environ:
+    os.environ['PYTHONWARNINGS'] = 'ignore'
+
+# Constants for tool paths relative to project root
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+TOOLS_DIR = PROJECT_ROOT / "tools"
+SPIDERFOOT_PATH = TOOLS_DIR / "spiderfoot" / "sf.py"
+BLACKBIRD_PATH = TOOLS_DIR / "blackbird" / "blackbird.py"
+GHUNT_PATH = TOOLS_DIR / "ghunt" / "main.py" 
 
 async def run_command_in_venv(command: List[str], cwd: Optional[str] = None, input_data: Optional[str] = None) -> tuple[str, str, int]:
     """Run a command in the virtual environment."""
     try:
-        # Set up environment - use system Python in container
+        # Set up environment
         env = os.environ.copy()
+        env["PYTHONWARNINGS"] = "ignore"
+        env["PYTHONUNBUFFERED"] = "1"
         
+        # Ensure venv/bin is in PATH for tools installed via pip
+        venv_bin = str(PROJECT_ROOT / "venv" / "bin")
+        if venv_bin not in env.get("PATH", ""):
+            env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
+            
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -33,7 +53,7 @@ async def run_command_in_venv(command: List[str], cwd: Optional[str] = None, inp
         return stdout.decode('utf-8', errors='ignore'), stderr.decode('utf-8', errors='ignore'), process.returncode
         
     except Exception as e:
-        return "", str(e), 1
+        return "", f"Command failed: {str(e)}", 1
 
 async def handle_sherlock(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle Sherlock username search."""
@@ -42,6 +62,7 @@ async def handle_sherlock(params: Dict[str, Any]) -> Dict[str, Any]:
     sites = params.get("sites", [])
     output_format = params.get("output_format", "csv")
     
+    # Use sherlock command (installed in venv)
     cmd = ["sherlock", username, f"--timeout", str(timeout)]
     
     if sites:
@@ -76,13 +97,13 @@ async def handle_sherlock(params: Dict[str, Any]) -> Dict[str, Any]:
             
             return {"success": True, "content": results}
         else:
-            return {"success": False, "error": f"Sherlock failed: {stderr}"}
+            return {"success": False, "error": f"Sherlock failed: {stderr or stdout}"}
 
 async def handle_holehe(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle Holehe email search."""
     email = params["email"]
     only_used = params.get("only_used", True)
-    timeout = params.get("timeout", 10000)
+    timeout = params.get("timeout", 10) # holehe usually expects timeout in seconds
     
     cmd = ["holehe", email, "--timeout", str(timeout)]
     if only_used:
@@ -93,52 +114,60 @@ async def handle_holehe(params: Dict[str, Any]) -> Dict[str, Any]:
     if returncode == 0:
         return {"success": True, "content": stdout}
     else:
-        return {"success": False, "error": f"Holehe failed: {stderr}"}
+        return {"success": False, "error": f"Holehe failed: {stderr or stdout}"}
 
 async def handle_spiderfoot(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle SpiderFoot comprehensive OSINT scan."""
     target = params["target"]
     
-    cmd = ["python3", "/opt/spiderfoot/sf.py", 
+    if not SPIDERFOOT_PATH.exists():
+        return {"success": False, "error": f"SpiderFoot not found at {SPIDERFOOT_PATH}. Please ensure it is installed."}
+
+    cmd = ["python3", str(SPIDERFOOT_PATH), 
            "-s", target,
            "-u", "all",      # Use all modules (gracefully skips those needing APIs)
            "-o", "json",     # JSON output
            "-q"]             # Quiet mode
     
-    stdout, stderr, returncode = await run_command_in_venv(cmd)
+    stdout, stderr, returncode = await run_command_in_venv(cmd, cwd=str(SPIDERFOOT_PATH.parent))
     
     if returncode == 0:
         return {"success": True, "content": stdout}
     else:
-        return {"success": False, "error": f"SpiderFoot failed: {stderr}"}
+        return {"success": False, "error": f"SpiderFoot failed: {stderr or stdout}"}
 
 async def handle_ghunt(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle GHunt Google account search."""
     identifier = params["identifier"]
-    timeout = params.get("timeout", 10000)
     
+    # Try using ghunt command if available
     cmd = ["ghunt", "email", identifier]
     
     stdout, stderr, returncode = await run_command_in_venv(cmd)
     
+    if returncode != 0 and GHUNT_PATH.exists():
+        # Try running via local path if command failed
+        cmd = ["python3", str(GHUNT_PATH), "email", identifier]
+        stdout, stderr, returncode = await run_command_in_venv(cmd, cwd=str(GHUNT_PATH.parent))
+    
     if returncode == 0:
         return {"success": True, "content": stdout}
     else:
-        return {"success": False, "error": f"GHunt failed: {stderr}"}
+        return {"success": False, "error": f"GHunt failed: {stderr or stdout}"}
 
 async def handle_maigret(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle Maigret username search."""
     username = params["username"]
     timeout = params.get("timeout", 10000)
     
-    cmd = ["maigret", username, "--timeout", str(timeout), "--json"]
+    cmd = ["maigret", username, "--timeout", str(timeout), "--json", "simple"]
     
     stdout, stderr, returncode = await run_command_in_venv(cmd)
     
     if returncode == 0:
         return {"success": True, "content": stdout}
     else:
-        return {"success": False, "error": f"Maigret failed: {stderr}"}
+        return {"success": False, "error": f"Maigret failed: {stderr or stdout}"}
 
 async def handle_theharvester(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle theHarvester domain/email enumeration."""
@@ -146,28 +175,39 @@ async def handle_theharvester(params: Dict[str, Any]) -> Dict[str, Any]:
     sources = params.get("sources", "all")
     limit = params.get("limit", 500)
     
-    cmd = ["theHarvester", "-d", domain, "-b", sources, "-l", str(limit)]
-    
-    stdout, stderr, returncode = await run_command_in_venv(cmd)
-    
-    if returncode == 0:
-        return {"success": True, "content": stdout}
-    else:
-        return {"success": False, "error": f"theHarvester failed: {stderr}"}
+    # Try both standard command and lowercase
+    try_commands = ["theHarvester", "theharvester"]
+    for base_cmd in try_commands:
+        cmd = [base_cmd, "-d", domain, "-b", sources, "-l", str(limit)]
+        stdout, stderr, returncode = await run_command_in_venv(cmd)
+        if returncode == 0:
+            return {"success": True, "content": stdout}
+            
+    return {"success": False, "error": f"theHarvester failed: {stderr or stdout}"}
 
 async def handle_blackbird(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle Blackbird username search."""
     username = params["username"]
     timeout = params.get("timeout", 10000)
     
-    cmd = ["python3", "/opt/blackbird/blackbird.py", "-u", username, "--timeout", str(timeout)]
+    if not BLACKBIRD_PATH.exists():
+        return {"success": False, "error": f"Blackbird not found at {BLACKBIRD_PATH}."}
+
+    # Setting PYTHONPATH ensures Blackbird can find its own modules
+    env = os.environ.copy()
+    # Correcting the path to include src/modules where utils and others reside
+    blackbird_src = BLACKBIRD_PATH.parent / 'src'
+    blackbird_modules = blackbird_src / 'modules'
+    env["PYTHONPATH"] = f"{BLACKBIRD_PATH.parent}:{blackbird_src}:{blackbird_modules}:{env.get('PYTHONPATH', '')}"
     
-    stdout, stderr, returncode = await run_command_in_venv(cmd)
+    cmd = ["python3", str(BLACKBIRD_PATH), "-u", username, "--timeout", str(timeout)]
+    
+    stdout, stderr, returncode = await run_command_in_venv(cmd, cwd=str(BLACKBIRD_PATH.parent))
     
     if returncode == 0:
         return {"success": True, "content": stdout}
     else:
-        return {"success": False, "error": f"Blackbird failed: {stderr}"}
+        return {"success": False, "error": f"Blackbird failed: {stderr or stdout}"}
 
 async def handle_tool_call(tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle tool calls by routing to appropriate handlers."""
